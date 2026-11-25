@@ -1,0 +1,14 @@
+.DS_Store
+obj_dir/
+__pycache__/
+*.vcd
+*.fst
+*.log
+*.jou
+*.wdb
+.Xil/
+*.cache/
+*.runs/
+*.sim/
+*.gen/
+.env
