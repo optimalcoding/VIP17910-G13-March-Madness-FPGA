@@ -1,932 +1,830 @@
 """
-March Madness FPGA Predictor — Complete Python Software Suite
-=============================================================
-Target Hardware : Digilent Basys 3 (Artix-7 XC7A35T-1CPG236C, 100 MHz clock)
-RTL Toolchain   : Vivado 2026.1
-Modules Covered :
-  1. M1 Shared Interface & Configurable Fixed-Point Formats (UQ8.8, Q9.8, UQ0.8 / UQ1.7)
-  2. Floating-Point Reference Model (weighted stat differences + logistic win probability)
-  3. Bit-Accurate Fixed-Point RTL Reference Model (`game_evaluator`, `probability_lut`,
-     `prng` 32-bit Galois LFSR, `outcome_decider`, `bracket_controller`, `result_counters`)
-  4. Basys 3 USB-UART Host Controller (`uart_rx + packet_parser` & `result_packetizer + uart_tx`
-     binary packet builder, XOR checksum framing, loopback tester, and CSV output logger)
-  5. Vivado Testbench Vector Exporter (`prob_lut.mem`, `team_stats.mem`, `initial_bracket.mem`,
-     `config_weights.mem`, and cycle-accurate 63-game trace CSV)
-  6. Historical Tournament Accuracy Evaluator & Laptop CPU vs. FPGA Speed Benchmarker
+March Madness FPGA Predictor — Bit-Exact Reference Model & Basys 3 UART Host
+=============================================================================
+Synchronized 100% bit-for-bit and byte-for-byte with `rtl_new/` and `data/mem/`:
+  - `top.sv` / `uart_ctrl.sv`      : 115,200 baud (CLKS_PER_BIT=868 @ 100 MHz),
+                                     CMD_LOAD (0x01), CMD_SET (0x02), CMD_START (0x03),
+                                     CMD_COUNTS (0x04), CMD_STATUS (0x05), ACK (0x06), NAK (0x15)
+  - `team_strength.sv` / `game_engine.sv`:
+                                     64-bit packed uint8 stats, weights [20, 20, 0, 18, 12, 9, 6, 15],
+                                     10 cycles/game, 696 cycles/tournament (+2 startup cycles)
+  - `probability_lut.sv`           : 101-entry 17-bit LUT (`data/mem/probability.mem`),
+                                     half-up index `magnitude[14:8] + magnitude[7]`, clamp at 100,
+                                     negative diff -> `65536 - positive_probability`
+  - `prng.sv` / `winner_select.sv` : 16-bit Fibonacci LFSR (reset `0xACE1`, taps 15^13^12^10),
+                                     sampled on CAPTURE before shifting; `{1'b0, rand} < probability`
+  - `tournament_ctrl.sv`           : Sequential 64->32->16->8->4->2->1 bracket advancement
 """
 
 import argparse
 import csv
 import math
-import os
-import random
 import struct
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Optional pyserial import for live Basys 3 USB-UART communication
 try:
-    import serial
+    import serial  # type: ignore
 except ImportError:
     serial = None
 
 
 # ==============================================================================
-# 1. M1 SHARED INTERFACE & FIXED-POINT CONFIGURATION
+# 1. HARDWARE CONSTANTS MATCHING `rtl_new/` & `data/preprocess.py`
 # ==============================================================================
 
-STAT_NAMES = [
-    "seed_rank",     # 0: Tournament seed (1..16)
-    "adj_off_eff",   # 1: Adjusted offensive efficiency (e.g., 80.0..140.0)
-    "adj_def_eff",   # 2: Adjusted defensive efficiency (e.g., 80.0..140.0)
-    "net_eff_diff",  # 3: Net efficiency differential (adj_off_eff - adj_def_eff)
-    "eFG%",          # 4: Effective field goal percentage
-    "TO%",           # 5: Turnover percentage
-    "off_rebnd%",    # 6: Offensive rebound percentage
-    "FTR",           # 7: Free throw rate
+FPGA_CLK_HZ = 100_000_000
+CLKS_PER_BIT = 868                  # 100 MHz / 868 = 115,207.37 baud (standard 115,200)
+DEFAULT_BAUD = 115200
+
+# UART Command & Response Bytes (`uart_ctrl.sv`)
+CMD_LOAD   = 0x01  # + 64 unique bytes (team_id 0..63) -> replies 1B ACK/NAK
+CMD_SET    = 0x02  # + 4B little-endian uint32 num_simulations -> replies 1B ACK/NAK
+CMD_START  = 0x03  # 0B payload -> replies 1B ACK/NAK
+CMD_COUNTS = 0x04  # 0B payload -> replies 1B ACK + 256B (64x little-endian uint32)
+CMD_STATUS = 0x05  # 0B payload -> replies 1B ACK + 1B flags + 4B little-endian total_sims
+ACK_BYTE   = 0x06
+NAK_BYTE   = 0x15
+
+# Metric order & weights (`data/preprocess.py` & `rtl_new/game_engine.sv`)
+METRICS = [
+    "adj_off_eff",   # [63:56] * 20
+    "adj_def_eff",   # [55:48] * 20
+    "net_eff_diff",  # [47:40] * 0 (omitted in hardware)
+    "efg_pct",       # [39:32] * 18
+    "to_pct",        # [31:24] * 12
+    "orb_pct",       # [23:16] * 9
+    "ftr",           # [15:8]  * 6
+    "seed_rank",     # [7:0]   * 15
 ]
+WEIGHTS = [20, 20, 0, 18, 12, 9, 6, 15]
 
+# Cycle-accurate timing constants (`game_engine.sv`, `tournament_ctrl.sv`, `simulation_ctrl.sv`)
+CYCLES_PER_GAME = 10                # ISSUE(1) + READ..CAPTURE(8) + WAIT_GAME_DONE(1)
+CYCLES_PER_TOURNAMENT = 1 + 64 + (63 * CYCLES_PER_GAME) + 1  # 696 cycles/bracket
+SIM_STARTUP_CYCLES = 2              # IDLE->CLEAR(1) + CLEAR->ISSUE(1)
 
-@dataclass
-class M1Config:
-    """
-    Shared M1 Hardware/Software Interface Parameters.
-    Supports switching percentage format between 'UQ0.8' (max ~0.996) and 'UQ1.7' (max ~1.992).
-    """
-    pct_format: str = "UQ0.8"       # 'UQ0.8' (scale=256) or 'UQ1.7' (scale=128)
-    lut_addr_bits: int = 10         # 1024-entry Probability LUT (fits in 1x 18Kb BRAM)
-    lut_max_score: float = 16.0     # Signed score range [-16.0, +16.0) mapped to LUT
-    prob_frac_bits: int = 16        # UQ0.16 win probability threshold [0..65535]
-    uart_baud: int = 115200         # Standard Basys 3 USB-UART baud rate
-    fpga_clk_hz: int = 100_000_000  # Basys 3 100 MHz onboard clock
-
-
-DEFAULT_WEIGHTS: Dict[str, float] = {
-    "seed_rank":    -0.08,
-    "adj_off_eff":   0.06,
-    "adj_def_eff":  -0.06,
-    "net_eff_diff":  0.08,
-    "eFG%":          2.50,
-    "TO%":          -2.00,
-    "off_rebnd%":    1.25,
-    "FTR":           0.75,
-}
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MEM_DIR = REPO_ROOT / "data" / "mem"
 
 
 # ==============================================================================
-# 2. BIT-ACCURATE FIXED-POINT HELPERS & HARDWARE ENCODING
+# 2. BIT-EXACT RTL MODELS (`team_strength`, `probability_lut`, `prng`, `game_engine`)
 # ==============================================================================
 
-def clamp(val: int, lo: int, hi: int) -> int:
-    return max(lo, min(hi, val))
-
-
-def to_twos_comp(val: int, bits: int) -> int:
-    """Convert signed Python int to unsigned two's-complement bit pattern of width `bits`."""
-    return val & ((1 << bits) - 1)
-
-
-def from_twos_comp(bits_val: int, bits: int) -> int:
-    """Sign-extend unsigned bit pattern of width `bits` to signed Python int."""
-    mask = (1 << bits) - 1
-    bits_val &= mask
-    if bits_val & (1 << (bits - 1)):
-        return bits_val - (1 << bits)
-    return bits_val
-
-
 @dataclass
-class TeamRecord:
+class TeamEntry:
     team_id: int
-    season: int
-    team: str
-    float_stats: Dict[str, float]
-    fp_stats: Dict[str, int]
+    team_name: str
+    packed_u64: int
+    strength: int  # 16-bit unsigned [0..25500]
 
 
-def normalize_percentage(val: float) -> float:
-    """Accepts either ratio (0.524) or percentage (52.4) from CSV and returns ratio."""
-    return val / 100.0 if val > 2.0 else val
-
-
-def encode_team_fp(
-    team_id: int,
-    season: int,
-    team: str,
-    raw_stats: Dict[str, float],
-    cfg: M1Config,
-) -> TeamRecord:
+def compute_team_strength(stats_u64: int) -> int:
     """
-    Encodes raw CSV statistics into M1 fixed-point hardware formats:
-      - seed_rank    : UQ5.0  (5-bit unsigned integer, 1..16)
-      - adj_off_eff  : UQ8.8  (16-bit unsigned, scale = 256, e.g. 115.5 * 256 = 29568)
-      - adj_def_eff  : UQ8.8  (16-bit unsigned, scale = 256, e.g. 98.25 * 256 = 25152)
-      - net_eff_diff : Q9.8   (17-bit signed two's complement, scale = 256, e.g. 17.25 * 256 = 4416)
-      - eFG%, TO%, off_rebnd%, FTR:
-          * 'UQ0.8': 8-bit unsigned, 8 frac bits (scale = 256, max = 255/256 = 0.99609375)
-          * 'UQ1.7': 8-bit unsigned, 7 frac bits (scale = 128, max = 255/128 = 1.9921875)
+    Bit-exact match for `team_strength.sv` and `game_engine.sv` (PRODUCTS->PAIRS->GROUPS->STRENGTH).
+    Byte [47:40] (`net_eff_diff`) has weight 0 and is intentionally omitted.
+    Maximum possible value = 255 * 100 = 25,500 (fits in uint16).
     """
-    clean_float = {
-        "seed_rank": float(raw_stats["seed_rank"]),
-        "adj_off_eff": float(raw_stats["adj_off_eff"]),
-        "adj_def_eff": float(raw_stats["adj_def_eff"]),
-        "net_eff_diff": float(raw_stats["net_eff_diff"]),
-        "eFG%": normalize_percentage(float(raw_stats["eFG%"])),
-        "TO%": normalize_percentage(float(raw_stats["TO%"])),
-        "off_rebnd%": normalize_percentage(float(raw_stats["off_rebnd%"])),
-        "FTR": normalize_percentage(float(raw_stats["FTR"])),
-    }
+    b7 = (stats_u64 >> 56) & 0xFF  # adj_off_eff
+    b6 = (stats_u64 >> 48) & 0xFF  # adj_def_eff
+    # b5 = (stats_u64 >> 40) & 0xFF (net_eff_diff, weight 0)
+    b4 = (stats_u64 >> 32) & 0xFF  # efg_pct
+    b3 = (stats_u64 >> 24) & 0xFF  # to_pct
+    b2 = (stats_u64 >> 16) & 0xFF  # orb_pct
+    b1 = (stats_u64 >> 8)  & 0xFF  # ftr
+    b0 = stats_u64 & 0xFF          # seed_rank
 
-    pct_scale = 256 if cfg.pct_format == "UQ0.8" else 128
-
-    fp = {
-        "seed_rank": clamp(int(round(clean_float["seed_rank"])), 1, 16),
-        "adj_off_eff": clamp(int(round(clean_float["adj_off_eff"] * 256)), 0, 65535),
-        "adj_def_eff": clamp(int(round(clean_float["adj_def_eff"] * 256)), 0, 65535),
-        "net_eff_diff": clamp(int(round(clean_float["net_eff_diff"] * 256)), -65536, 65535),
-        "eFG%": clamp(int(round(clean_float["eFG%"] * pct_scale)), 0, 255),
-        "TO%": clamp(int(round(clean_float["TO%"] * pct_scale)), 0, 255),
-        "off_rebnd%": clamp(int(round(clean_float["off_rebnd%"] * pct_scale)), 0, 255),
-        "FTR": clamp(int(round(clean_float["FTR"] * pct_scale)), 0, 255),
-    }
-    return TeamRecord(team_id=team_id, season=season, team=team, float_stats=clean_float, fp_stats=fp)
-
-
-def encode_weights_fp(weights: Dict[str, float]) -> Dict[str, int]:
-    """Encodes metric weights as signed 16-bit Q8.8 integers [-32768, +32767]."""
-    return {k: clamp(int(round(weights[k] * 256)), -32768, 32767) for k in STAT_NAMES}
-
-
-def pack_team_bram_word(rec: TeamRecord) -> int:
-    """
-    Packs all 8 encoded statistics of a single team into a byte-aligned 96-bit (12-byte)
-    word for `team_stats_mem` BRAM and UART `LOAD_TEAM` packets:
-      [95:88] seed_rank    (8-bit zero-extended from 5-bit UQ5.0)
-      [87:72] adj_off_eff  (16-bit UQ8.8)
-      [71:56] adj_def_eff  (16-bit UQ8.8)
-      [55:32] net_eff_diff (24-bit sign-extended from 17-bit Q9.8 two's complement)
-      [31:24] eFG%         (8-bit UQ0.8 or UQ1.7)
-      [23:16] TO%          (8-bit UQ0.8 or UQ1.7)
-      [15:8]  off_rebnd%   (8-bit UQ0.8 or UQ1.7)
-      [7:0]   FTR          (8-bit UQ0.8 or UQ1.7)
-    """
-    fp = rec.fp_stats
-    net_u24 = to_twos_comp(fp["net_eff_diff"], 24)
     return (
-        ((fp["seed_rank"] & 0xFF) << 88)
-        | ((fp["adj_off_eff"] & 0xFFFF) << 72)
-        | ((fp["adj_def_eff"] & 0xFFFF) << 56)
-        | ((net_u24 & 0xFFFFFF) << 32)
-        | ((fp["eFG%"] & 0xFF) << 24)
-        | ((fp["TO%"] & 0xFF) << 16)
-        | ((fp["off_rebnd%"] & 0xFF) << 8)
-        | (fp["FTR"] & 0xFF)
+        b7 * 20
+        + b6 * 20
+        + b4 * 18
+        + b3 * 12
+        + b2 * 9
+        + b1 * 6
+        + b0 * 15
     )
-
-
-# ==============================================================================
-# 3. RTL MODULE EQUIVALENTS (PRNG, PROBABILITY LUT, GAME EVALUATOR, BRACKET)
-# ==============================================================================
-
-class HardwareLFSR32:
-    """
-    Deterministic 32-bit Galois LFSR matching RTL `prng` module.
-    Polynomial: x^32 + x^22 + x^2 + x^1 + 1 (0x80200003, maximal period 2^32 - 1).
-    Advances once per game; upper 16 bits supply UQ0.16 random value to `outcome_decider`.
-    """
-    POLY_MASK = 0x80200003
-
-    def __init__(self, seed: int = 0xACE1BEEF):
-        self.state = (seed & 0xFFFFFFFF) or 0x00000001
-
-    def step(self) -> int:
-        lsb = self.state & 1
-        self.state >>= 1
-        if lsb:
-            self.state ^= self.POLY_MASK
-        return (self.state >> 16) & 0xFFFF
 
 
 class ProbabilityLUT:
     """
-    Bit-accurate ROM model for RTL `probability_lut` module.
-    Maps signed Q16.16 weighted score to 16-bit UQ0.16 win probability threshold:
-      threshold = round(65535 / (1 + exp(-score)))
+    Bit-exact match for `rtl_new/probability_lut.sv` and `data/generate_lut.py`.
+    101 entries of 17-bit unsigned thresholds (`0x08000` .. `0x10000`).
     """
-    def __init__(self, cfg: M1Config):
-        self.cfg = cfg
-        self.size = 1 << cfg.lut_addr_bits        # 1024 entries
-        self.max_val = (1 << cfg.prob_frac_bits) - 1  # 65535
-        self.step_size = (2.0 * cfg.lut_max_score) / self.size  # 0.03125 (2^-5)
-        self.table: List[int] = [
-            clamp(
-                int(round(self.max_val / (1.0 + math.exp(-(-cfg.lut_max_score + (i + 0.5) * self.step_size))))),
-                0,
-                self.max_val,
-            )
-            for i in range(self.size)
-        ]
+    SCALE = 3000
+    STEP = 256
+    ENTRIES = 101
 
-    def score_q16_to_index(self, score_q16: int) -> int:
+    def __init__(self, mem_path: Optional[Path] = None):
+        if mem_path is not None and mem_path.exists():
+            lines = [
+                ln.strip() for ln in mem_path.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("//")
+            ]
+            self.mem = [int(x, 16) & 0x1FFFF for x in lines[:self.ENTRIES]]
+            if len(self.mem) != self.ENTRIES:
+                raise ValueError(f"Expected {self.ENTRIES} entries in {mem_path}, got {len(self.mem)}")
+        else:
+            # Exact formula from `data/generate_lut.py`
+            self.mem = [
+                round((1.0 / (1.0 + math.exp(-(i * self.STEP) / self.SCALE))) * 65536)
+                for i in range(self.ENTRIES)
+            ]
+
+    def lookup(self, strength_diff: int) -> Tuple[int, int]:
         """
-        Hardware bit-slice LUT indexing from signed Q16.16 score:
-        Clamps score to [-16.0, +15.96875], arithmetic right-shifts by 11 bits (step = 2^-5),
-        and adds 512 midpoint offset.
+        Input: signed 17-bit `strength_diff = strength_a - strength_b` in [-25500, +25500].
+        Returns: `(lut_index, probability_u17)` matching `probability_lut.sv` bit-for-bit.
         """
-        min_q16 = int(-self.cfg.lut_max_score * 65536)
-        max_q16 = int(self.cfg.lut_max_score * 65536) - (1 << 11)
-        clamped = clamp(score_q16, min_q16, max_q16)
-        idx = (clamped >> 11) + (self.size >> 1)
-        return clamp(idx, 0, self.size - 1)
+        is_neg = strength_diff < 0
+        magnitude = -strength_diff if is_neg else strength_diff
+
+        if magnitude >= 25600:
+            index = 100
+        else:
+            # `magnitude[14:8] + {6'b0, magnitude[7]}`
+            index = ((magnitude >> 8) & 0x7F) + ((magnitude >> 7) & 0x1)
+
+        pos_prob = self.mem[index]
+        probability = (65536 - pos_prob) if is_neg else pos_prob
+        return index, probability
 
 
-class MarchMadnessModel:
+class HardwarePRNG16:
     """
-    Dual Floating-Point Reference & Bit-Accurate Fixed-Point Hardware Simulator.
+    Bit-exact match for `rtl_new/prng.sv` + `game_engine.sv` (`CAPTURE` state):
+      - 16-bit Fibonacci LFSR, reset value `16'hACE1`
+      - `feedback = random_value[15] ^ random_value[13] ^ random_value[12] ^ random_value[10]`
+      - `game_engine.sv` uses the CURRENT `random_value` during `CAPTURE`, and pulses
+        `prng_enable` on that same clock edge to advance for the next game.
     """
-    def __init__(self, cfg: Optional[M1Config] = None, weights: Optional[Dict[str, float]] = None):
-        self.cfg = cfg or M1Config()
-        self.float_weights = dict(weights or DEFAULT_WEIGHTS)
-        self.fp_weights = encode_weights_fp(self.float_weights)
-        self.lut = ProbabilityLUT(self.cfg)
+    RESET_SEED = 0xACE1
 
-    def evaluate_game_float(self, team_a: TeamRecord, team_b: TeamRecord) -> Tuple[float, float]:
-        """Floating-point weighted difference & logistic win probability for Team A."""
-        score = sum(
-            self.float_weights[s] * (team_a.float_stats[s] - team_b.float_stats[s])
-            for s in STAT_NAMES
+    def __init__(self, seed: int = RESET_SEED):
+        self.state = seed & 0xFFFF
+
+    def sample_and_step(self) -> int:
+        current = self.state
+        feedback = (
+            ((current >> 15) & 1)
+            ^ ((current >> 13) & 1)
+            ^ ((current >> 12) & 1)
+            ^ ((current >> 10) & 1)
         )
-        prob_a = 1.0 / (1.0 + math.exp(-score))
-        return score, prob_a
+        self.state = ((current << 1) | feedback) & 0xFFFF
+        return current
 
-    def evaluate_game_fp(self, team_a: TeamRecord, team_b: TeamRecord) -> Tuple[int, int, int]:
-        """
-        Bit-accurate model of RTL `game_evaluator` + `probability_lut`:
-          1. Zero-extends unsigned 16-bit efficiencies (`adj_off_eff`, `adj_def_eff`) to
-             signed 17-bit values before subtraction so negative differences are exact (Page 8).
-          2. Aligns all 8 signed differences to Q10.8 (8 fractional bits).
-          3. Multiplies each Q10.8 difference by its signed 16-bit Q8.8 weight (Basys 3 DSP48E1)
-             producing Q18.16 products, summed into a signed accumulator.
-          4. Indexes `probability_lut` to output a 16-bit UQ0.16 win threshold.
-        """
-        a = team_a.fp_stats
-        b = team_b.fp_stats
-        pct_shift = 0 if self.cfg.pct_format == "UQ0.8" else 1
 
-        diffs_q8 = {
-            "seed_rank":    (int(a["seed_rank"]) - int(b["seed_rank"])) << 8,
-            "adj_off_eff":  int(a["adj_off_eff"]) - int(b["adj_off_eff"]),
-            "adj_def_eff":  int(a["adj_def_eff"]) - int(b["adj_def_eff"]),
-            "net_eff_diff": int(a["net_eff_diff"]) - int(b["net_eff_diff"]),
-            "eFG%":         (int(a["eFG%"]) - int(b["eFG%"])) << pct_shift,
-            "TO%":          (int(a["TO%"]) - int(b["TO%"])) << pct_shift,
-            "off_rebnd%":   (int(a["off_rebnd%"]) - int(b["off_rebnd%"])) << pct_shift,
-            "FTR":          (int(a["FTR"]) - int(b["FTR"])) << pct_shift,
-        }
+class RTLReferenceSimulator:
+    """
+    Cycle- and bit-accurate golden model of `simulation_ctrl` -> `tournament_ctrl` -> `game_engine`.
+    """
+    def __init__(self, teams: Dict[int, TeamEntry], lut: ProbabilityLUT):
+        if len(teams) != 64 or sorted(teams.keys()) != list(range(64)):
+            raise ValueError("Teams dictionary must contain exact team_ids 0..63.")
+        self.teams = teams
+        self.lut = lut
 
-        acc_q16 = 0
-        for stat in STAT_NAMES:
-            acc_q16 += diffs_q8[stat] * self.fp_weights[stat]
+    def evaluate_matchup(self, team_a_id: int, team_b_id: int) -> Tuple[int, int, int, int, int]:
+        """Returns `(strength_a, strength_b, strength_diff, lut_index, probability_u17)`."""
+        sa = self.teams[team_a_id].strength
+        sb = self.teams[team_b_id].strength
+        diff = sa - sb
+        idx, prob = self.lut.lookup(diff)
+        return sa, sb, diff, idx, prob
 
-        acc_q16 = clamp(acc_q16, -(1 << 31), (1 << 31) - 1)
-        lut_idx = self.lut.score_q16_to_index(acc_q16)
-        threshold = self.lut.table[lut_idx]
-        return acc_q16, lut_idx, threshold
-
-    def simulate_single_bracket_fp(
+    def run_single_tournament(
         self,
-        teams_by_id: Dict[int, TeamRecord],
-        initial_bracket_ids: List[int],
-        prng: HardwareLFSR32,
-        trace_games: Optional[List[Dict]] = None,
+        bracket_order: List[int],
+        prng: HardwarePRNG16,
+        trace: Optional[List[Dict]] = None,
     ) -> int:
-        """Sequential single-lane tournament simulation matching `bracket_controller`."""
-        current_round = list(initial_bracket_ids)
+        """
+        Matches `tournament_ctrl.sv` (`INIT` -> 6 rounds of `32, 16, 8, 4, 2, 1` games).
+        Writes winners back into `bracket_mem[0 .. games_this_round-1]`.
+        """
+        bracket_mem = list(bracket_order)
+        games_this_round = 32
         round_num = 1
-        while len(current_round) > 1:
-            next_round = []
-            for i in range(0, len(current_round), 2):
-                id_a, id_b = current_round[i], current_round[i + 1]
-                acc_q16, lut_idx, thresh = self.evaluate_game_fp(teams_by_id[id_a], teams_by_id[id_b])
-                rand_u16 = prng.step()
-                winner_id = id_a if rand_u16 < thresh else id_b
-                next_round.append(winner_id)
+        game_counter = 0
 
-                if trace_games is not None:
-                    trace_games.append({
+        while games_this_round >= 1:
+            for game_index in range(games_this_round):
+                id_a = bracket_mem[2 * game_index]
+                id_b = bracket_mem[2 * game_index + 1]
+
+                sa, sb, diff, lut_idx, prob = self.evaluate_matchup(id_a, id_b)
+                rand_val = prng.sample_and_step()
+
+                # `winner_select.sv`: `{1'b0, random_value} < probability`
+                winner_id = id_a if rand_val < prob else id_b
+                bracket_mem[game_index] = winner_id
+
+                if trace is not None:
+                    trace.append({
+                        "game_idx": game_counter,
                         "round": round_num,
+                        "game_in_round": game_index,
                         "team_a_id": id_a,
                         "team_b_id": id_b,
-                        "acc_q16": acc_q16,
+                        "strength_a": sa,
+                        "strength_b": sb,
+                        "strength_diff": diff,
                         "lut_idx": lut_idx,
-                        "thresh_u16": thresh,
-                        "rand_u16": rand_u16,
+                        "probability_hex": f"{prob:05X}",
+                        "random_hex": f"{rand_val:04X}",
                         "winner_id": winner_id,
                     })
-            current_round = next_round
+                game_counter += 1
+
+            if games_this_round == 1:
+                return bracket_mem[0]
+            games_this_round >>= 1
             round_num += 1
-        return current_round[0]
 
-    def run_monte_carlo_fp(
+        return bracket_mem[0]
+
+    def run_simulations(
         self,
-        teams_by_id: Dict[int, TeamRecord],
-        initial_bracket_ids: List[int],
-        num_sims: int = 1000,
-        seed: int = 0xACE1BEEF,
+        bracket_order: List[int],
+        num_simulations: int,
+        seed: int = HardwarePRNG16.RESET_SEED,
     ) -> Dict:
-        """Bit-accurate Monte Carlo simulation matching `main_controller` + `result_counters`."""
-        prng = HardwareLFSR32(seed=seed)
-        champ_counts = {tid: 0 for tid in initial_bracket_ids}
+        """
+        Matches `simulation_ctrl.sv` + `result_counters.sv`.
+        Note: On FPGA, `prng` resets to `0xACE1` on `reset` button / power-up and
+        continues across multiple `CMD_START` runs unless `reset` is asserted.
+        """
+        validate_bracket_order(bracket_order)
+        prng = HardwarePRNG16(seed=seed)
+        win_counts = [0] * 64
 
         t0 = time.perf_counter()
-        for _ in range(num_sims):
-            champ_id = self.simulate_single_bracket_fp(teams_by_id, initial_bracket_ids, prng)
-            champ_counts[champ_id] += 1
-        elapsed_s = time.perf_counter() - t0
+        for _ in range(num_simulations):
+            champ = self.run_single_tournament(bracket_order, prng)
+            win_counts[champ] += 1
+        cpu_time_s = time.perf_counter() - t0
 
-        games_per_sim = len(initial_bracket_ids) - 1
-        est_cycles_per_game = 6  # Sequential single-lane pipeline estimate
-        est_fpga_cycles = num_sims * games_per_sim * est_cycles_per_game
-        est_fpga_time_s = est_fpga_cycles / self.cfg.fpga_clk_hz
+        exact_cycles = 1 if num_simulations == 0 else (SIM_STARTUP_CYCLES + num_simulations * CYCLES_PER_TOURNAMENT)
+        fpga_time_s = exact_cycles / FPGA_CLK_HZ
 
         return {
-            "champ_counts": champ_counts,
-            "completed_runs": num_sims,
-            "cpu_time_s": elapsed_s,
-            "est_fpga_cycles": est_fpga_cycles,
-            "est_fpga_time_s": est_fpga_time_s,
-            "final_lfsr_state": prng.state,
-        }
-
-    def run_monte_carlo_float(
-        self,
-        teams_by_id: Dict[int, TeamRecord],
-        initial_bracket_ids: List[int],
-        num_sims: int = 1000,
-        seed: int = 42,
-    ) -> Dict:
-        """Floating-point Monte Carlo simulation for baseline accuracy comparison."""
-        rng = random.Random(seed)
-        champ_counts = {tid: 0 for tid in initial_bracket_ids}
-
-        t0 = time.perf_counter()
-        for _ in range(num_sims):
-            current_round = list(initial_bracket_ids)
-            while len(current_round) > 1:
-                next_round = []
-                for i in range(0, len(current_round), 2):
-                    id_a, id_b = current_round[i], current_round[i + 1]
-                    _, prob_a = self.evaluate_game_float(teams_by_id[id_a], teams_by_id[id_b])
-                    next_round.append(id_a if rng.random() < prob_a else id_b)
-                current_round = next_round
-            champ_counts[current_round[0]] += 1
-        elapsed_s = time.perf_counter() - t0
-
-        return {
-            "champ_counts": champ_counts,
-            "completed_runs": num_sims,
-            "cpu_time_s": elapsed_s,
+            "win_counts": win_counts,
+            "total_simulations": num_simulations,
+            "cpu_time_s": cpu_time_s,
+            "fpga_cycles": exact_cycles,
+            "fpga_time_s": fpga_time_s,
+            "final_prng_state": prng.state,
         }
 
 
 # ==============================================================================
-# 4. UART PACKETIZER, RESULT PARSER, AND BASYS 3 HOST INTERFACE
+# 3. DATA LOADERS FOR `data/mem/teams_<year>.mem` & `reference_<year>.csv`
 # ==============================================================================
-# Framing (Big-Endian):
-#   [SOF=0xAA] [PKT_TYPE (1B)] [PAYLOAD_LEN (2B)] [PAYLOAD...] [XOR_CSUM (1B)] [EOF=0x55]
 
-SOF_BYTE = 0xAA
-EOF_BYTE = 0x55
-
-PKT_LOAD_CONFIG    = 0x01  # 8x int16 weights + uint32 sim_count + uint32 seed (24 B)
-PKT_LOAD_TEAM      = 0x02  # uint8 team_id + 12B packed 96-bit fixed-point stats (13 B)
-PKT_LOAD_BRACKET   = 0x03  # 64x uint8 initial bracket team IDs (64 B)
-PKT_START_RUN      = 0x04  # Trigger simulation state machine (0 B)
-PKT_LOOPBACK_PING  = 0x05  # M4 board UART loopback verification ping
-PKT_RESULT_SUMMARY = 0x81  # uint32 runs + uint64 cycles + 64x (uint8 id, uint32 wins) (332 B)
-PKT_LOOPBACK_ACK   = 0x85  # M4 board UART loopback echo response
-
-
-def compute_xor_checksum(pkt_type: int, payload: bytes) -> int:
-    plen = len(payload)
-    csum = pkt_type ^ ((plen >> 8) & 0xFF) ^ (plen & 0xFF)
-    for b in payload:
-        csum ^= b
-    return csum & 0xFF
+def validate_bracket_order(bracket_order: List[int]) -> None:
+    """Enforces `uart_ctrl.sv` `invalid_team` rules: 64 unique IDs in 0..63."""
+    if len(bracket_order) != 64:
+        raise ValueError(f"Bracket must have exactly 64 entries, got {len(bracket_order)}.")
+    seen = set()
+    for idx, tid in enumerate(bracket_order):
+        if not (0 <= tid <= 63):
+            raise ValueError(f"Bracket slot {idx} has out-of-range team_id {tid} (must be 0..63).")
+        if tid in seen:
+            raise ValueError(f"Duplicate team_id {tid} at slot {idx} (`uart_ctrl.sv` rejects duplicates with NAK).")
+        seen.add(tid)
 
 
-def build_uart_frame(pkt_type: int, payload: bytes = b"") -> bytes:
-    header = struct.pack(">BH", pkt_type, len(payload))
-    csum = compute_xor_checksum(pkt_type, payload)
-    return bytes([SOF_BYTE]) + header + payload + bytes([csum, EOF_BYTE])
+def load_season_data(
+    mem_dir: Path,
+    season: int,
+) -> Tuple[Dict[int, TeamEntry], Optional[Path]]:
+    """
+    Loads `teams_<season>.mem` and optional `reference_<season>.csv` (for team names
+    and verification against `expected_rtl_score` generated by `preprocess.py`).
+    """
+    mem_file = mem_dir / f"teams_{season}.mem"
+    ref_file = mem_dir / f"reference_{season}.csv"
+
+    if not mem_file.exists():
+        raise FileNotFoundError(f"Could not find {mem_file}")
+
+    hex_lines = [
+        ln.strip() for ln in mem_file.read_text(encoding="utf-8").splitlines()
+        if ln.strip() and not ln.strip().startswith("//")
+    ]
+    if len(hex_lines) != 64:
+        raise ValueError(f"Expected 64 lines in {mem_file}, found {len(hex_lines)}.")
+
+    names_by_id: Dict[int, str] = {i: f"Team_{i:02d}" for i in range(64)}
+    expected_scores: Dict[int, int] = {}
+
+    if ref_file.exists():
+        with open(ref_file, mode="r", newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                tid = int(row["team_id"])
+                names_by_id[tid] = row.get("team_name", f"Team_{tid:02d}").strip()
+                if "expected_rtl_score" in row and row["expected_rtl_score"] != "":
+                    expected_scores[tid] = int(float(row["expected_rtl_score"]))
+
+    teams: Dict[int, TeamEntry] = {}
+    for tid, hex_str in enumerate(hex_lines):
+        packed_u64 = int(hex_str, 16)
+        strength = compute_team_strength(packed_u64)
+        if tid in expected_scores and strength != expected_scores[tid]:
+            raise ValueError(
+                f"Strength mismatch for team {tid} ({names_by_id[tid]}): "
+                f"computed {strength} vs reference CSV {expected_scores[tid]}"
+            )
+        teams[tid] = TeamEntry(
+            team_id=tid,
+            team_name=names_by_id[tid],
+            packed_u64=packed_u64,
+            strength=strength,
+        )
+
+    return teams, (ref_file if ref_file.exists() else None)
 
 
-def parse_uart_frame(frame: bytes) -> Tuple[int, bytes]:
-    if len(frame) < 6 or frame[0] != SOF_BYTE or frame[-1] != EOF_BYTE:
-        raise ValueError("Invalid UART frame delimiters (SOF/EOF mismatch).")
-    pkt_type, plen = struct.unpack(">BH", frame[1:4])
-    if len(frame) != plen + 6:
-        raise ValueError(f"Frame length mismatch: expected {plen + 6}, got {len(frame)}.")
-    payload = frame[4:4 + plen]
-    expected_csum = compute_xor_checksum(pkt_type, payload)
-    if frame[-2] != expected_csum:
-        raise ValueError(f"UART checksum error: expected 0x{expected_csum:02X}, got 0x{frame[-2]:02X}.")
-    return pkt_type, payload
+def load_bracket_file(bracket_path: Optional[Path]) -> List[int]:
+    """
+    Loads a 64-entry initial bracket order from `.mem` (hex), `.txt` (int), or `.csv` (`team_id` column).
+    Defaults to `[0, 1, 2, ..., 63]` if no custom bracket file is supplied.
+    """
+    if bracket_path is None:
+        return list(range(64))
+
+    if bracket_path.suffix.lower() == ".csv":
+        with open(bracket_path, mode="r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            ids = [int(row["team_id"]) for row in reader]
+    else:
+        lines = [
+            ln.strip() for ln in bracket_path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("//")
+        ]
+        base = 16 if bracket_path.suffix.lower() == ".mem" else 0
+        ids = [int(x, base) for x in lines]
+
+    validate_bracket_order(ids)
+    return ids
 
 
-def make_config_packet(fp_weights: Dict[str, int], sim_count: int, seed: int) -> bytes:
-    w_packed = b"".join(struct.pack(">h", fp_weights[s]) for s in STAT_NAMES)
-    payload = w_packed + struct.pack(">II", sim_count, seed & 0xFFFFFFFF)
-    return build_uart_frame(PKT_LOAD_CONFIG, payload)
+# ==============================================================================
+# 4. BASYS 3 UART PROTOCOL CLIENT (`rtl_new/uart_ctrl.sv` EXACT BINARY PROTOCOL)
+# ==============================================================================
+
+class VirtualBasys3Board:
+    """
+    In-memory byte-accurate emulator of `uart_ctrl.sv` + `simulation_ctrl.sv`
+    for offline testing before connecting the physical Basys 3 USB cable.
+    """
+    def __init__(self, sim: RTLReferenceSimulator):
+        self.sim = sim
+        self.prng = HardwarePRNG16(HardwarePRNG16.RESET_SEED)
+        self.bracket_loaded = False
+        self.results_valid = False
+        self.sim_busy = False
+        self.bracket = [0] * 64
+        self.num_simulations = 0
+        self.total_simulations = 0
+        self.win_counts = [0] * 64
+        self._rx_buf = bytearray()
+        self._tx_buf = bytearray()
+
+    def write(self, data: bytes) -> int:
+        self._rx_buf.extend(data)
+        self._process()
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def read(self, size: int = 1) -> bytes:
+        out = bytes(self._tx_buf[:size])
+        del self._tx_buf[:size]
+        return out
+
+    def close(self) -> None:
+        pass
+
+    def _process(self) -> None:
+        while self._rx_buf:
+            cmd = self._rx_buf[0]
+            if cmd == CMD_LOAD:
+                if len(self._rx_buf) < 65:
+                    return
+                payload = list(self._rx_buf[1:65])
+                del self._rx_buf[:65]
+                seen = set()
+                bad = self.sim_busy
+                for b in payload:
+                    if (b >> 6) != 0 or b in seen:
+                        bad = True
+                    else:
+                        seen.add(b)
+                if bad:
+                    self._tx_buf.append(NAK_BYTE)
+                else:
+                    self.bracket = payload
+                    self.bracket_loaded = True
+                    self.results_valid = False
+                    self._tx_buf.append(ACK_BYTE)
+
+            elif cmd == CMD_SET:
+                if len(self._rx_buf) < 5:
+                    return
+                (count_val,) = struct.unpack("<I", bytes(self._rx_buf[1:5]))
+                del self._rx_buf[:5]
+                if self.sim_busy:
+                    self._tx_buf.append(NAK_BYTE)
+                else:
+                    self.num_simulations = count_val
+                    self._tx_buf.append(ACK_BYTE)
+
+            elif cmd == CMD_START:
+                del self._rx_buf[:1]
+                if self.sim_busy or not self.bracket_loaded:
+                    self._tx_buf.append(NAK_BYTE)
+                else:
+                    self._tx_buf.append(ACK_BYTE)
+                    self.win_counts = [0] * 64
+                    for _ in range(self.num_simulations):
+                        champ = self.sim.run_single_tournament(self.bracket, self.prng)
+                        self.win_counts[champ] += 1
+                    self.total_simulations = self.num_simulations
+                    self.results_valid = True
+
+            elif cmd == CMD_STATUS:
+                del self._rx_buf[:1]
+                flags = (
+                    ((1 if self.bracket_loaded else 0) << 2)
+                    | ((1 if self.results_valid else 0) << 1)
+                    | (1 if self.sim_busy else 0)
+                )
+                self._tx_buf.extend(struct.pack("<BBI", ACK_BYTE, flags, self.total_simulations))
+
+            elif cmd == CMD_COUNTS:
+                del self._rx_buf[:1]
+                if self.sim_busy or not self.results_valid:
+                    self._tx_buf.append(NAK_BYTE)
+                else:
+                    self._tx_buf.append(ACK_BYTE)
+                    self._tx_buf.extend(struct.pack("<64I", *self.win_counts))
+
+            else:
+                del self._rx_buf[:1]
+                self._tx_buf.append(NAK_BYTE)
 
 
-def make_team_packet(rec: TeamRecord) -> bytes:
-    word96 = pack_team_bram_word(rec)
-    payload = struct.pack(">B", rec.team_id) + word96.to_bytes(12, byteorder="big")
-    return build_uart_frame(PKT_LOAD_TEAM, payload)
-
-
-def make_bracket_packet(initial_bracket_ids: List[int]) -> bytes:
-    return build_uart_frame(PKT_LOAD_BRACKET, bytes(tid & 0xFF for tid in initial_bracket_ids))
-
-
-def make_start_packet() -> bytes:
-    return build_uart_frame(PKT_START_RUN, b"")
-
-
-def encode_fpga_result_packet(
-    completed_runs: int,
-    compute_cycles: int,
-    champ_counts: Dict[int, int],
-) -> bytes:
-    payload = bytearray(struct.pack(">IQ", completed_runs, compute_cycles))
-    for tid in sorted(champ_counts.keys()):
-        payload += struct.pack(">BI", tid & 0xFF, champ_counts[tid])
-    return build_uart_frame(PKT_RESULT_SUMMARY, bytes(payload))
-
-
-def decode_fpga_result_packet(frame: bytes) -> Dict:
-    pkt_type, payload = parse_uart_frame(frame)
-    if pkt_type != PKT_RESULT_SUMMARY:
-        raise ValueError(f"Unexpected packet type 0x{pkt_type:02X} (expected 0x81).")
-    completed_runs, compute_cycles = struct.unpack(">IQ", payload[:12])
-    champ_counts = {}
-    offset = 12
-    while offset + 5 <= len(payload):
-        tid, wins = struct.unpack(">BI", payload[offset:offset + 5])
-        champ_counts[tid] = wins
-        offset += 5
-    return {
-        "completed_runs": completed_runs,
-        "compute_cycles": compute_cycles,
-        "champ_counts": champ_counts,
-    }
-
-
-class Basys3HostInterface:
-    """Manages USB-UART communication with the Digilent Basys 3 board."""
-    def __init__(self, port: Optional[str] = None, baudrate: int = 115200, timeout: float = 10.0):
+class Basys3UARTClient:
+    """
+    Host controller speaking the exact binary protocol of `rtl_new/uart_ctrl.sv`:
+      - CMD_LOAD   (0x01) + 64B team IDs       -> 1B ACK (0x06)
+      - CMD_SET    (0x02) + 4B uint32 LE sims  -> 1B ACK (0x06)
+      - CMD_START  (0x03)                      -> 1B ACK (0x06)
+      - CMD_STATUS (0x05)                      -> 6B: ACK + flags + uint32 LE total_simulations
+      - CMD_COUNTS (0x04)                      -> 257B: ACK + 64x uint32 LE win_counts
+    """
+    def __init__(
+        self,
+        port: Optional[str] = None,
+        baudrate: int = DEFAULT_BAUD,
+        timeout: float = 5.0,
+        virtual_board: Optional[VirtualBasys3Board] = None,
+    ):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
-        self.ser = None
+        self.dev = virtual_board
 
-    def connect(self):
-        if self.port is None:
+    def connect(self) -> None:
+        if self.dev is not None:
             return
+        if not self.port:
+            raise ValueError("Specify `--uart-port` (e.g., COM4) or pass a `VirtualBasys3Board`.")
         if serial is None:
-            raise RuntimeError("pyserial is required for hardware UART (`pip install pyserial`).")
-        self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+            raise RuntimeError("pyserial is not installed. Run: `py -m pip install pyserial`")
+        self.dev = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
+        time.sleep(0.05)  # Allow FT2232HQ USB-UART bridge to settle
+        if hasattr(self.dev, "reset_input_buffer"):
+            self.dev.reset_input_buffer()
 
-    def close(self):
-        if self.ser and self.ser.is_open:
-            self.ser.close()
+    def close(self) -> None:
+        if self.dev is not None:
+            self.dev.close()
 
-    def run_loopback_test(self, test_bytes: bytes = b"BASYS3_M4_OK") -> bool:
-        """M4 Pre-Break Checkpoint: Verifies board USB-UART RX/TX framing integrity."""
-        tx_frame = build_uart_frame(PKT_LOOPBACK_PING, test_bytes)
-        if not (self.ser and self.ser.is_open):
-            # Offline virtual loopback check
-            mock_rx = build_uart_frame(PKT_LOOPBACK_ACK, test_bytes)
-            rx_type, rx_payload = parse_uart_frame(mock_rx)
-            return rx_type == PKT_LOOPBACK_ACK and rx_payload == test_bytes
+    def _read_exact(self, n: int) -> bytes:
+        assert self.dev is not None
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self.dev.read(n - len(buf))
+            if not chunk:
+                raise TimeoutError(f"UART timeout: expected {n} bytes from Basys 3, received {len(buf)}.")
+            buf.extend(chunk)
+        return bytes(buf)
 
-        self.ser.write(tx_frame)
-        self.ser.flush()
-        rx_frame = self.receive_frame()
-        rx_type, rx_payload = parse_uart_frame(rx_frame)
-        return rx_type == PKT_LOOPBACK_ACK and rx_payload == test_bytes
+    def _expect_ack(self, cmd_name: str) -> None:
+        resp = self._read_exact(1)[0]
+        if resp == NAK_BYTE:
+            raise RuntimeError(f"Basys 3 returned NAK (0x15) for {cmd_name}.")
+        if resp != ACK_BYTE:
+            raise RuntimeError(f"Unexpected response 0x{resp:02X} for {cmd_name} (expected ACK 0x06).")
 
-    def transmit_tournament_job(
-        self,
-        model: MarchMadnessModel,
-        teams_by_id: Dict[int, TeamRecord],
-        initial_bracket_ids: List[int],
-        num_sims: int,
-        seed: int,
-    ) -> List[bytes]:
-        frames = [make_config_packet(model.fp_weights, num_sims, seed)]
-        for tid in sorted(teams_by_id.keys()):
-            frames.append(make_team_packet(teams_by_id[tid]))
-        frames.append(make_bracket_packet(initial_bracket_ids))
-        frames.append(make_start_packet())
+    def load_bracket(self, bracket_order: List[int]) -> None:
+        """Sends `CMD_LOAD (0x01)` + 64 unique 6-bit team IDs."""
+        validate_bracket_order(bracket_order)
+        assert self.dev is not None
+        pkt = bytes([CMD_LOAD]) + bytes(bracket_order)
+        self.dev.write(pkt)
+        self.dev.flush()
+        self._expect_ack("CMD_LOAD")
 
-        if self.ser and self.ser.is_open:
-            for f in frames:
-                self.ser.write(f)
-            self.ser.flush()
-        return frames
+    def set_num_simulations(self, num_simulations: int) -> None:
+        """Sends `CMD_SET (0x02)` + 4-byte little-endian `num_simulations`."""
+        if not (0 <= num_simulations <= 0xFFFFFFFF):
+            raise ValueError("num_simulations must fit in 32-bit unsigned integer.")
+        assert self.dev is not None
+        pkt = struct.pack("<BI", CMD_SET, num_simulations)
+        self.dev.write(pkt)
+        self.dev.flush()
+        self._expect_ack("CMD_SET")
 
-    def receive_frame(self) -> bytes:
-        if not (self.ser and self.ser.is_open):
-            raise RuntimeError("Serial port is not open.")
+    def start_simulation(self) -> None:
+        """Sends `CMD_START (0x03)` to launch tournament runs on Basys 3."""
+        assert self.dev is not None
+        self.dev.write(bytes([CMD_START]))
+        self.dev.flush()
+        self._expect_ack("CMD_START")
+
+    def get_status(self) -> Dict:
+        """Sends `CMD_STATUS (0x05)` and parses `{bracket_loaded, results_valid, sim_busy}` + `total_simulations`."""
+        assert self.dev is not None
+        self.dev.write(bytes([CMD_STATUS]))
+        self.dev.flush()
+        self._expect_ack("CMD_STATUS")
+        raw = self._read_exact(5)
+        flags, total_sims = struct.unpack("<BI", raw)
+        return {
+            "raw_flags": flags,
+            "sim_busy": bool(flags & 0x01),
+            "results_valid": bool((flags >> 1) & 0x01),
+            "bracket_loaded": bool((flags >> 2) & 0x01),
+            "total_simulations": total_sims,
+        }
+
+    def wait_until_done(self, poll_interval_s: float = 0.005, max_wait_s: float = 60.0) -> Dict:
+        """Polls `CMD_STATUS` until `sim_busy == 0` and `results_valid == 1`."""
+        t0 = time.perf_counter()
         while True:
-            b = self.ser.read(1)
-            if not b:
-                raise TimeoutError("Timed out waiting for Basys 3 UART SOF (0xAA).")
-            if b[0] == SOF_BYTE:
-                break
-        hdr = self.ser.read(3)
-        _, plen = struct.unpack(">BH", hdr)
-        rest = self.ser.read(plen + 2)
-        return bytes([SOF_BYTE]) + hdr + rest
+            st = self.get_status()
+            if not st["sim_busy"] and st["results_valid"]:
+                return st
+            if (time.perf_counter() - t0) > max_wait_s:
+                raise TimeoutError(f"Simulation did not finish within {max_wait_s}s (last status: {st}).")
+            time.sleep(poll_interval_s)
+
+    def read_win_counts(self) -> List[int]:
+        """Sends `CMD_COUNTS (0x04)` and reads 256 bytes (64 little-endian uint32 championship counts)."""
+        assert self.dev is not None
+        self.dev.write(bytes([CMD_COUNTS]))
+        self.dev.flush()
+        self._expect_ack("CMD_COUNTS")
+        payload = self._read_exact(256)
+        return list(struct.unpack("<64I", payload))
+
+    def run_full_job(self, bracket_order: List[int], num_simulations: int) -> Tuple[List[int], Dict, float]:
+        """Executes full host->FPGA workflow: LOAD -> SET -> START -> POLL STATUS -> READ COUNTS."""
+        self.load_bracket(bracket_order)
+        self.set_num_simulations(num_simulations)
+        t0 = time.perf_counter()
+        self.start_simulation()
+        status = self.wait_until_done()
+        wall_s = time.perf_counter() - t0
+        counts = self.read_win_counts()
+        return counts, status, wall_s
 
 
 # ==============================================================================
-# 5. CSV DATA PIPELINE, HISTORICAL ACCURACY, & VIVADO TESTBENCH EXPORTER
+# 5. CSV LOGGING & TESTBENCH TRACE EXPORT
 # ==============================================================================
-
-def load_teams_csv(csv_path: str, season: int, cfg: M1Config) -> Tuple[Dict[int, TeamRecord], Dict[str, int]]:
-    teams_by_id: Dict[int, TeamRecord] = {}
-    name_to_id: Dict[str, int] = {}
-    next_id = 0
-
-    with open(csv_path, mode="r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if int(row["season"]) != season:
-                continue
-            raw_stats = {stat: float(row[stat]) for stat in STAT_NAMES}
-            rec = encode_team_fp(next_id, season, row["team"].strip(), raw_stats, cfg)
-            teams_by_id[next_id] = rec
-            name_to_id[rec.team] = next_id
-            next_id += 1
-    return teams_by_id, name_to_id
-
 
 def save_results_csv(
-    output_csv_path: str,
+    out_csv: Path,
     season: int,
-    teams_by_id: Dict[int, TeamRecord],
-    completed_runs: int,
-    compute_cycles: int,
-    champ_counts: Dict[int, int],
-    fpga_clk_hz: int = 100_000_000,
-):
-    fpga_time_ms = (compute_cycles / fpga_clk_hz) * 1000.0
+    teams: Dict[int, TeamEntry],
+    win_counts: List[int],
+    total_simulations: int,
+) -> None:
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    exact_cycles = 1 if total_simulations == 0 else (SIM_STARTUP_CYCLES + total_simulations * CYCLES_PER_TOURNAMENT)
+    fpga_ms = (exact_cycles / FPGA_CLK_HZ) * 1000.0
+
     rows = []
-    for tid, wins in champ_counts.items():
-        rec = teams_by_id[tid]
+    for tid in range(64):
+        t = teams[tid]
+        wins = win_counts[tid]
         rows.append({
             "season": season,
             "team_id": tid,
-            "team": rec.team,
-            "seed_rank": int(rec.float_stats["seed_rank"]),
-            "championship_count": wins,
-            "win_probability": round(wins / max(1, completed_runs), 6),
-            "completed_runs": completed_runs,
-            "compute_cycles": compute_cycles,
-            "fpga_compute_time_ms": round(fpga_time_ms, 4),
+            "team_name": t.team_name,
+            "rtl_strength": t.strength,
+            "win_count": wins,
+            "win_probability": round(wins / max(1, total_simulations), 6),
+            "total_simulations": total_simulations,
+            "exact_fpga_cycles": exact_cycles,
+            "fpga_compute_ms": round(fpga_ms, 4),
         })
-    rows.sort(key=lambda r: (-r["championship_count"], r["seed_rank"], r["team"]))
+    rows.sort(key=lambda r: (-r["win_count"], -r["rtl_strength"], r["team_id"]))
 
-    fieldnames = [
-        "season", "team_id", "team", "seed_rank",
-        "championship_count", "win_probability",
-        "completed_runs", "compute_cycles", "fpga_compute_time_ms",
-    ]
-    with open(output_csv_path, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    with open(out_csv, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
 
-def evaluate_historical_results(
-    results_csv_path: str,
-    season: int,
-    model: MarchMadnessModel,
-    teams_by_id: Dict[int, TeamRecord],
-    name_to_id: Dict[str, int],
-    mc_champ_counts: Dict[int, int],
-    completed_runs: int,
-) -> Dict:
-    total_games = 0
-    correct_float = 0
-    correct_fp = 0
-    fp_float_agree = 0
-    actual_champion = None
-    max_round = -1
-
-    with open(results_csv_path, mode="r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if int(row["season"]) != season:
-                continue
-            rnd = int(row["round"])
-            ta = teams_by_id[name_to_id[row["team_a"].strip()]]
-            tb = teams_by_id[name_to_id[row["team_b"].strip()]]
-            actual_win_name = row["winner"].strip()
-
-            _, prob_a_flt = model.evaluate_game_float(ta, tb)
-            pred_flt = ta.team if prob_a_flt >= 0.5 else tb.team
-
-            _, _, thresh_u16 = model.evaluate_game_fp(ta, tb)
-            pred_fp = ta.team if thresh_u16 >= 32768 else tb.team
-
-            total_games += 1
-            if pred_flt == actual_win_name:
-                correct_float += 1
-            if pred_fp == actual_win_name:
-                correct_fp += 1
-            if pred_flt == pred_fp:
-                fp_float_agree += 1
-
-            if rnd >= max_round:
-                max_round = rnd
-                actual_champion = actual_win_name
-
-    champ_hit_rate = 0.0
-    if actual_champion and actual_champion in name_to_id:
-        cid = name_to_id[actual_champion]
-        champ_hit_rate = mc_champ_counts.get(cid, 0) / max(1, completed_runs)
-
-    return {
-        "total_games": total_games,
-        "correct_games_float": correct_float,
-        "correct_games_fp": correct_fp,
-        "accuracy_fp_pct": 100.0 * correct_fp / max(1, total_games),
-        "fp_vs_float_agreement_pct": 100.0 * fp_float_agree / max(1, total_games),
-        "actual_champion": actual_champion,
-        "champion_hit_rate": champ_hit_rate,
-    }
-
-
-def export_vivado_test_vectors(
-    out_dir: str,
-    model: MarchMadnessModel,
-    teams_by_id: Dict[int, TeamRecord],
-    initial_bracket_ids: List[int],
-    seed: int = 0xACE1BEEF,
-) -> Tuple[int, List[Dict]]:
-    """
-    Generates `.mem` BRAM/ROM files (for Verilog `$readmemh`) and cycle-accurate
-    game evaluation vectors for Vivado 2026.1 module & top-level testbenches.
-    """
-    os.makedirs(out_dir, exist_ok=True)
-
-    with open(os.path.join(out_dir, "prob_lut.mem"), "w") as f:
-        for val in model.lut.table:
-            f.write(f"{val:04X}\n")
-
-    with open(os.path.join(out_dir, "team_stats.mem"), "w") as f:
-        for tid in sorted(teams_by_id.keys()):
-            f.write(f"{pack_team_bram_word(teams_by_id[tid]):024X}\n")
-
-    with open(os.path.join(out_dir, "initial_bracket.mem"), "w") as f:
-        for tid in initial_bracket_ids:
-            f.write(f"{tid & 0xFF:02X}\n")
-
-    with open(os.path.join(out_dir, "config_weights.mem"), "w") as f:
-        for stat in STAT_NAMES:
-            f.write(f"{to_twos_comp(model.fp_weights[stat], 16):04X}\n")
-
-    prng = HardwareLFSR32(seed=seed)
+def export_single_tournament_trace(
+    trace_csv: Path,
+    sim: RTLReferenceSimulator,
+    bracket_order: List[int],
+    seed: int = HardwarePRNG16.RESET_SEED,
+) -> int:
+    trace_csv.parent.mkdir(parents=True, exist_ok=True)
+    prng = HardwarePRNG16(seed=seed)
     trace: List[Dict] = []
-    champ_id = model.simulate_single_bracket_fp(teams_by_id, initial_bracket_ids, prng, trace_games=trace)
+    champ_id = sim.run_single_tournament(bracket_order, prng, trace=trace)
 
-    vec_path = os.path.join(out_dir, "tb_single_bracket_vec.csv")
-    with open(vec_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "game_idx", "round", "team_a_id", "team_b_id",
-            "acc_q16_signed", "acc_q16_hex", "lut_idx",
-            "thresh_u16_hex", "rand_u16_hex", "winner_id",
-        ])
+    with open(trace_csv, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(trace[0].keys()))
         writer.writeheader()
-        for idx, g in enumerate(trace):
-            writer.writerow({
-                "game_idx": idx,
-                "round": g["round"],
-                "team_a_id": g["team_a_id"],
-                "team_b_id": g["team_b_id"],
-                "acc_q16_signed": g["acc_q16"],
-                "acc_q16_hex": f"{to_twos_comp(g['acc_q16'], 32):08X}",
-                "lut_idx": g["lut_idx"],
-                "thresh_u16_hex": f"{g['thresh_u16']:04X}",
-                "rand_u16_hex": f"{g['rand_u16']:04X}",
-                "winner_id": g["winner_id"],
-            })
-    return champ_id, trace
+        writer.writerows(trace)
+    return champ_id
 
 
 # ==============================================================================
-# 6. DEMO DATASET GENERATOR, CLI ENTRYPOINT, & SELF-TEST
+# 6. SELF-TEST & CLI ENTRYPOINT
 # ==============================================================================
 
-def generate_demo_tournament_csvs(teams_csv: str, results_csv: str, season: int = 2025):
+def _build_synthetic_teams() -> Dict[int, TeamEntry]:
+    """Fallback synthetic 64-team set if `data/mem/teams_<year>.mem` is not found."""
+    import random
     rng = random.Random(2025)
-    regions = ["East", "West", "South", "Midwest"]
-    bracket_seed_order = [1, 16, 8, 9, 5, 12, 4, 13, 6, 11, 3, 14, 7, 10, 2, 15]
-
-    team_rows = []
-    for reg in regions:
-        for s in bracket_seed_order:
-            adj_off = round(124.5 - s * 1.35 + rng.uniform(-2.5, 2.5), 2)
-            adj_def = round(91.0 + s * 1.15 + rng.uniform(-2.5, 2.5), 2)
-            net_eff = round(adj_off - adj_def, 2)
-            efg = round(0.565 - s * 0.004 + rng.uniform(-0.015, 0.015), 4)
-            to_pct = round(0.150 + s * 0.0025 + rng.uniform(-0.012, 0.012), 4)
-            orb_pct = round(0.345 - s * 0.0035 + rng.uniform(-0.02, 0.02), 4)
-            ftr = round(0.365 - s * 0.003 + rng.uniform(-0.025, 0.025), 4)
-            team_rows.append({
-                "season": season,
-                "team": f"{reg}_Seed{s}",
-                "seed_rank": s,
-                "adj_off_eff": adj_off,
-                "adj_def_eff": adj_def,
-                "net_eff_diff": net_eff,
-                "eFG%": efg,
-                "TO%": to_pct,
-                "off_rebnd%": orb_pct,
-                "FTR": ftr,
-            })
-
-    with open(teams_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["season", "team"] + STAT_NAMES)
-        writer.writeheader()
-        writer.writerows(team_rows)
-
-    cfg = M1Config()
-    model = MarchMadnessModel(cfg)
-    teams_by_id, _ = load_teams_csv(teams_csv, season, cfg)
-    curr_ids = list(range(64))
-    hist_rows = []
-    rnd = 1
-    while len(curr_ids) > 1:
-        nxt = []
-        for i in range(0, len(curr_ids), 2):
-            ta, tb = teams_by_id[curr_ids[i]], teams_by_id[curr_ids[i + 1]]
-            _, p_a = model.evaluate_game_float(ta, tb)
-            win = ta if rng.random() < p_a else tb
-            nxt.append(win.team_id)
-            hist_rows.append({
-                "season": season,
-                "round": rnd,
-                "team_a": ta.team,
-                "team_b": tb.team,
-                "winner": win.team,
-            })
-        curr_ids = nxt
-        rnd += 1
-
-    with open(results_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["season", "round", "team_a", "team_b", "winner"])
-        writer.writeheader()
-        writer.writerows(hist_rows)
+    teams: Dict[int, TeamEntry] = {}
+    for tid in range(64):
+        vals = [rng.randint(40, 240) for _ in range(8)]
+        packed = 0
+        for v in vals:
+            packed = (packed << 8) | v
+        teams[tid] = TeamEntry(
+            team_id=tid,
+            team_name=f"Synthetic_Team_{tid:02d}",
+            packed_u64=packed,
+            strength=compute_team_strength(packed),
+        )
+    return teams
 
 
-def run_self_test():
-    print("=== March Madness FPGA Predictor — Software Suite Verification ===")
-    cfg = M1Config(pct_format="UQ0.8")
+def run_self_test(mem_dir: Path, season: int = 2025) -> None:
+    print("=== March Madness Basys 3 (`rtl_new`) — Bit-Exact Verification ===")
 
-    # 1. Verify Page 8 Fixed-Point Format Examples
-    sample = encode_team_fp(
-        0, 2026, "Page8_Check",
-        {
-            "seed_rank": 1, "adj_off_eff": 115.5, "adj_def_eff": 98.25,
-            "net_eff_diff": 17.25, "eFG%": 0.55, "TO%": 0.16, "off_rebnd%": 0.32, "FTR": 0.35,
-        },
-        cfg,
-    )
-    assert sample.fp_stats["adj_off_eff"] == 29568
-    assert sample.fp_stats["adj_def_eff"] == 25152
-    assert sample.fp_stats["net_eff_diff"] == 4416
-    print("[PASS] Page 8 Fixed-Point Encoding Check: 115.5->29568, 98.25->25152, 17.25->4416")
+    # 1. Load real `data/mem/probability.mem` & `teams_<season>.mem` if present in repo
+    prob_path = mem_dir / "probability.mem"
+    lut = ProbabilityLUT(prob_path if prob_path.exists() else None)
+    assert lut.mem[0] == 0x08000, f"Expected LUT[0]=0x08000, got 0x{lut.mem[0]:05X}"
+    idx_neg, prob_neg = lut.lookup(-256)
+    idx_pos, prob_pos = lut.lookup(+256)
+    assert idx_neg == 1 and idx_pos == 1 and (prob_neg + prob_pos) == 65536
+    print(f"[PASS] ProbabilityLUT (`probability_lut.sv`): {len(lut.mem)} entries, symmetry & 17-bit complement verified"
+          + (f" from `{prob_path.name}`" if prob_path.exists() else " (built-in formula)"))
 
-    # 2. Build Demo Tournament Dataset
-    os.makedirs("demo_artifacts", exist_ok=True)
-    teams_csv = "demo_artifacts/teams_demo.csv"
-    hist_csv = "demo_artifacts/historical_results_demo.csv"
-    out_log_csv = "demo_artifacts/fpga_simulation_results.csv"
-    generate_demo_tournament_csvs(teams_csv, hist_csv, season=2025)
+    team_mem_file = mem_dir / f"teams_{season}.mem"
+    if team_mem_file.exists():
+        teams, ref_csv = load_season_data(mem_dir, season)
+        print(f"[PASS] Loaded `{team_mem_file.name}`"
+              + (f" & verified all 64 `expected_rtl_score` values against `{ref_csv.name}`!" if ref_csv else ""))
+    else:
+        teams = _build_synthetic_teams()
+        print(f"[INFO] `{team_mem_file}` not found in `{mem_dir}`; running self-test with synthetic 64-team BRAM.")
 
-    teams_by_id, name_to_id = load_teams_csv(teams_csv, 2025, cfg)
-    bracket_ids = list(range(64))
-    model = MarchMadnessModel(cfg)
+    # 2. Verify 16-bit PRNG sequence (`prng.sv`: reset=0xACE1, taps 15^13^12^10)
+    prng = HardwarePRNG16()
+    first_rand = prng.sample_and_step()
+    second_rand = prng.sample_and_step()
+    assert first_rand == 0xACE1, "First game must sample reset seed 0xACE1 before shifting!"
+    # 0xACE1 = 1010_1100_1110_0001 -> b15=1, b13=1, b12=0, b10=1 -> feedback = 1^1^0^1 = 1 -> (0xACE1<<1)|1 = 0x59C3
+    assert second_rand == 0x59C3, f"Expected second LFSR state 0x59C3, got 0x{second_rand:04X}"
+    print("[PASS] 16-bit PRNG (`prng.sv`): Game #1 samples 0xACE1 -> shifts to 0x59C3 on CAPTURE")
 
-    # 3. Quantization Error Check (Float vs Fixed-Point LUT)
-    max_prob_err = 0.0
-    for i in range(0, 64, 2):
-        _, p_flt = model.evaluate_game_float(teams_by_id[i], teams_by_id[i + 1])
-        _, _, thresh_u16 = model.evaluate_game_fp(teams_by_id[i], teams_by_id[i + 1])
-        max_prob_err = max(max_prob_err, abs(p_flt - (thresh_u16 / 65535.0)))
-    print(f"[PASS] Round-of-64 Float vs Fixed-Point Max Win-Prob Error: {max_prob_err:.5f}")
-
-    # 4. Run 10,000 Monte Carlo Simulations & UART Packetizer/Parser Verification
+    # 3. Verify `VirtualBasys3Board` UART byte stream matches `RTLReferenceSimulator` 100%
+    sim = RTLReferenceSimulator(teams, lut)
+    bracket_order = list(range(64))
     num_sims = 10_000
-    seed = 0xACE1BEEF
-    fp_res = model.run_monte_carlo_fp(teams_by_id, bracket_ids, num_sims=num_sims, seed=seed)
 
-    host = Basys3HostInterface(port=None)
-    assert host.run_loopback_test(), "Virtual UART loopback failed!"
-    tx_frames = host.transmit_tournament_job(model, teams_by_id, bracket_ids, num_sims, seed)
-    total_tx_bytes = sum(len(f) for f in tx_frames)
-    mock_rx_frame = encode_fpga_result_packet(
-        fp_res["completed_runs"], fp_res["est_fpga_cycles"], fp_res["champ_counts"]
-    )
-    decoded_rx = decode_fpga_result_packet(mock_rx_frame)
-    assert decoded_rx["champ_counts"] == fp_res["champ_counts"]
-    print(f"[PASS] UART Framing & Checksum Loopback: TX={len(tx_frames)} pkts ({total_tx_bytes} B), RX={len(mock_rx_frame)} B")
+    ref_res = sim.run_simulations(bracket_order, num_sims, seed=HardwarePRNG16.RESET_SEED)
 
-    # 5. Export Output Log CSV & Vivado Testbench Vectors
-    save_results_csv(
-        out_log_csv, 2025, teams_by_id,
-        decoded_rx["completed_runs"], decoded_rx["compute_cycles"], decoded_rx["champ_counts"]
-    )
-    champ_run1, _ = export_vivado_test_vectors("demo_artifacts/vivado_vectors", model, teams_by_id, bracket_ids, seed)
-    print(f"[PASS] Vivado RTL Vectors Exported: prob_lut.mem, team_stats.mem, tb_single_bracket_vec.csv (Run#1 Champ ID={champ_run1})")
+    vboard = VirtualBasys3Board(sim)
+    client = Basys3UARTClient(virtual_board=vboard)
+    client.connect()
+    uart_counts, st, _ = client.run_full_job(bracket_order, num_sims)
+    client.close()
 
-    # 6. Historical Accuracy & Speed Benchmark Summary
-    acc = evaluate_historical_results(
-        hist_csv, 2025, model, teams_by_id, name_to_id, fp_res["champ_counts"], num_sims
-    )
-    speedup = fp_res["cpu_time_s"] / fp_res["est_fpga_time_s"]
+    assert uart_counts == ref_res["win_counts"], "UART counts mismatch against reference model!"
+    assert sum(uart_counts) == num_sims and st["total_simulations"] == num_sims
+    print(f"[PASS] UART Protocol (`uart_ctrl.sv`): CMD_LOAD(65B) -> CMD_SET(5B) -> CMD_START(1B) -> "
+          f"CMD_STATUS(6B) -> CMD_COUNTS(257B) matched all {num_sims:,} wins 100%!")
+
+    # 4. Print Top-5 Champions & Exact Cycle/Speed Benchmark
+    ranked = sorted(range(64), key=lambda i: (-uart_counts[i], -teams[i].strength))[:5]
+    top_str = ", ".join(f"{teams[i].team_name} ({uart_counts[i]*100/num_sims:.2f}%)" for i in ranked)
+    print(f"[INFO] Top 5 Simulated Champions ({season}): {top_str}")
+
+    speedup = ref_res["cpu_time_s"] / ref_res["fpga_time_s"]
     print(
-        f"[INFO] Historical Eval: {acc['correct_games_fp']}/{acc['total_games']} games ({acc['accuracy_fp_pct']:.1f}%), "
-        f"FP/Float Agreement: {acc['fp_vs_float_agreement_pct']:.1f}%, "
-        f"Champ Hit Rate ({acc['actual_champion']}): {acc['champion_hit_rate']*100:.2f}%"
-    )
-    print(
-        f"[INFO] Speed Benchmark ({num_sims:,} brackets / {num_sims*63:,} games): "
-        f"Python CPU = {fp_res['cpu_time_s']*1000:.1f} ms | "
-        f"Basys 3 @ 100 MHz (1-lane est.) = {fp_res['est_fpga_time_s']*1000:.2f} ms ({speedup:.1f}x speedup)"
+        f"[INFO] Speed Benchmark ({num_sims:,} brackets = {ref_res['fpga_cycles']:,} exact FPGA clock cycles): "
+        f"Python CPU = {ref_res['cpu_time_s']*1000:.1f} ms | "
+        f"Basys 3 @ 100 MHz = {ref_res['fpga_time_s']*1000:.2f} ms ({speedup:.1f}x speedup)"
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="March Madness FPGA Predictor Host & Reference Suite")
-    parser.add_argument("--self-test", action="store_true", help="Run built-in verification & demo suite")
-    parser.add_argument("--teams-csv", type=str, help="Path to team-statistics CSV")
-    parser.add_argument("--results-csv", type=str, default=None, help="Optional historical results CSV for accuracy")
-    parser.add_argument("--season", type=int, default=2025, help="Tournament season year")
-    parser.add_argument("--sims", type=int, default=10000, help="Number of Monte Carlo bracket simulations")
-    parser.add_argument("--seed", type=lambda x: int(x, 0), default=0xACE1BEEF, help="32-bit PRNG seed (hex or int)")
-    parser.add_argument("--pct-format", choices=["UQ0.8", "UQ1.7"], default="UQ0.8", help="8-bit percentage format")
-    parser.add_argument("--uart-port", type=str, default=None, help="Serial port for Basys 3 (e.g. COM4 or /dev/ttyUSB1)")
-    parser.add_argument("--baud", type=int, default=115200, help="UART baud rate")
-    parser.add_argument("--export-vectors", type=str, default="vivado_vectors", help="Directory for Vivado .mem & TB vectors")
-    parser.add_argument("--out-csv", type=str, default="fpga_results_log.csv", help="Output CSV log path")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="March Madness Basys 3 (`rtl_new`) Reference & UART Host")
+    parser.add_argument("--self-test", action="store_true", help="Verify RTL math, `data/mem` files, & UART protocol")
+    parser.add_argument("--season", type=int, default=2025, help="Season year matching `data/mem/teams_<year>.mem`")
+    parser.add_argument("--mem-dir", type=Path, default=DEFAULT_MEM_DIR, help="Path to `data/mem` directory")
+    parser.add_argument("--bracket-file", type=Path, default=None, help="Optional 64-line bracket order file (.mem/.txt/.csv)")
+    parser.add_argument("--sims", type=int, default=10000, help="Number of Monte Carlo tournament simulations")
+    parser.add_argument("--seed", type=lambda x: int(x, 0), default=0xACE1, help="16-bit LFSR seed for Python reference run")
+    parser.add_argument("--uart-port", type=str, default=None, help="Basys 3 COM port (e.g. COM4 or /dev/ttyUSB1)")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="UART baud rate (default: 115200)")
+    parser.add_argument("--status-only", action="store_true", help="Query `CMD_STATUS` from Basys 3 and exit")
+    parser.add_argument("--out-csv", type=Path, default=None, help="Save championship counts & probabilities to CSV")
+    parser.add_argument("--export-trace", type=Path, default=None, help="Export 63-game Run #1 trace CSV for Vivado TB")
     args = parser.parse_args()
 
-    if args.self_test or not args.teams_csv:
-        run_self_test()
+    if args.self_test:
+        run_self_test(args.mem_dir, args.season)
         return
 
-    cfg = M1Config(pct_format=args.pct_format, uart_baud=args.baud)
-    model = MarchMadnessModel(cfg)
-    teams_by_id, name_to_id = load_teams_csv(args.teams_csv, args.season, cfg)
-    bracket_ids = sorted(teams_by_id.keys())
-
-    export_vivado_test_vectors(args.export_vectors, model, teams_by_id, bracket_ids, args.seed)
-    print(f"Exported Vivado test vectors to `{args.export_vectors}/`.")
-
-    if args.uart_port:
-        host = Basys3HostInterface(port=args.uart_port, baudrate=args.baud)
-        host.connect()
+    if args.status_only:
+        if not args.uart_port:
+            raise SystemExit("Error: `--status-only` requires `--uart-port <COMx>`.")
+        client = Basys3UARTClient(port=args.uart_port, baudrate=args.baud)
+        client.connect()
         try:
-            host.transmit_tournament_job(model, teams_by_id, bracket_ids, args.sims, args.seed)
-            rx_frame = host.receive_frame()
-            hw_res = decode_fpga_result_packet(rx_frame)
+            st = client.get_status()
+            print(f"Basys 3 Status: {st}")
         finally:
-            host.close()
-        champ_counts = hw_res["champ_counts"]
-        cycles = hw_res["compute_cycles"]
-        runs = hw_res["completed_runs"]
-    else:
-        fp_res = model.run_monte_carlo_fp(teams_by_id, bracket_ids, num_sims=args.sims, seed=args.seed)
-        champ_counts = fp_res["champ_counts"]
-        cycles = fp_res["est_fpga_cycles"]
-        runs = fp_res["completed_runs"]
+            client.close()
+        return
 
-    save_results_csv(args.out_csv, args.season, teams_by_id, runs, cycles, champ_counts, cfg.fpga_clk_hz)
-    print(f"Saved simulation results log to `{args.out_csv}`.")
+    teams, ref_csv = load_season_data(args.mem_dir, args.season)
+    lut = ProbabilityLUT(args.mem_dir / "probability.mem")
+    sim = RTLReferenceSimulator(teams, lut)
+    bracket_order = load_bracket_file(args.bracket_file)
 
-    if args.results_csv:
-        acc = evaluate_historical_results(
-            args.results_csv, args.season, model, teams_by_id, name_to_id, champ_counts, runs
-        )
-        print(f"Historical Accuracy: {acc['correct_games_fp']}/{acc['total_games']} ({acc['accuracy_fp_pct']:.2f}%), "
-              f"Champion Hit Rate ({acc['actual_champion']}): {acc['champion_hit_rate']*100:.2f}%")
+    if args.export_trace is not None:
+        champ_id = export_single_tournament_trace(args.export_trace, sim, bracket_order, seed=args.seed)
+        print(f"Exported 63-game hardware trace to `{args.export_trace}` (Tournament #1 Champion: "
+              f"ID={champ_id}, {teams[champ_id].team_name}).")
+
+    # Always run Python bit-accurate reference model for comparison & speed benchmarking
+    ref_res = sim.run_simulations(bracket_order, args.sims, seed=args.seed)
+    active_counts = ref_res["win_counts"]
+
+    print(f"Reference Model ({args.season}, {args.sims:,} sims): "
+          f"CPU = {ref_res['cpu_time_s']*1000:.1f} ms | "
+          f"Exact FPGA Cycles = {ref_res['fpga_cycles']:,} ({ref_res['fpga_time_s']*1000:.2f} ms @ 100 MHz)")
+
+    # If `--uart-port` is supplied, run on physical Basys 3 and compare!
+    if args.uart_port:
+        client = Basys3UARTClient(port=args.uart_port, baudrate=args.baud)
+        client.connect()
+        try:
+            hw_counts, st, wall_s = client.run_full_job(bracket_order, args.sims)
+        finally:
+            client.close()
+
+        active_counts = hw_counts
+        exact_match = (hw_counts == ref_res["win_counts"])
+        print(f"Basys 3 Hardware Run Complete (UART round-trip = {wall_s*1000:.1f} ms, status={st})")
+        if exact_match:
+            print("[MATCH] Basys 3 hardware win counts match Python reference model 100% identically!")
+        else:
+            print("[NOTE] Hardware counts differ from initial seed 0xACE1 (press Basys 3 reset button before "
+                  "running if you want PRNG to restart from 16'hACE1; PRNG continues across runs otherwise).")
+
+    ranked = sorted(range(64), key=lambda i: (-active_counts[i], -teams[i].strength))[:10]
+    print("\nTop 10 Championship Contenders:")
+    for rank, tid in enumerate(ranked, start=1):
+        pct = 100.0 * active_counts[tid] / max(1, args.sims)
+        print(f"  {rank:2d}. [ID {tid:2d}] {teams[tid].team_name:<24} "
+              f"Strength={teams[tid].strength:5d} | Wins={active_counts[tid]:6d} ({pct:5.2f}%)")
+
+    out_path = args.out_csv or (REPO_ROOT / "sw" / f"results_{args.season}.csv")
+    save_results_csv(out_path, args.season, teams, active_counts, args.sims)
+    print(f"\nSaved CSV log to `{out_path}`.")
 
 
 if __name__ == "__main__":
