@@ -1,7 +1,11 @@
 `timescale 1ns/1ps
 module tb_top #(
     parameter TEAM_FILE = "teams_2025.mem",
-    parameter PROB_FILE = "probability.mem"
+    parameter PROB_FILE = "probability.mem",
+    // Python reference: 2025 memories, bracket IDs 63 down to 0, seed 0xACE1.
+    // Override both champions if testing different memory contents.
+    parameter logic [5:0] PYTHON_CHAMPION_1 = 6'd0, // Duke
+    parameter logic [5:0] PYTHON_CHAMPION_2 = 6'd5  // BYU
 );
     localparam integer CLKS_PER_BIT = 16, BIT_TIME = CLKS_PER_BIT * 10;
     logic clk, reset, rx, tx, busy, done;
@@ -121,8 +125,9 @@ module tb_top #(
         repeat (2) @(negedge clk);
     endtask
 
-    task automatic check_results(input logic [31:0] n);
+    task automatic check_results(input logic [31:0] n, input bit compare_python);
         logic [7:0] data;
+        logic [31:0] python_count;
         sum = 0;
         send_byte(8'h04);
         expect_byte(8'h06);
@@ -133,6 +138,15 @@ module tb_top #(
             end
             if (count_value !== expected[i])
                 $fatal(1, "Team %0d: expected %0d, received %0d", i, expected[i], count_value);
+            if (compare_python) begin
+                python_count = 32'd0;
+                if (i == int'(PYTHON_CHAMPION_1))
+                    python_count++;
+                if (i == int'(PYTHON_CHAMPION_2))
+                    python_count++;
+                if (count_value !== python_count)
+                    $fatal(1, "Team %0d: Python expected %0d wins, UART returned %0d", i, python_count, count_value);
+            end
             sum = sum + {32'd0, count_value};
             if (count_value != 0)
                 $display("Team %0d: %0d wins", i, count_value);
@@ -180,8 +194,8 @@ module tb_top #(
         finish_reply();
         wait_for_batch();
         check_status(8'h06, 32'd2);
-        check_results(32'd2);
-        $display("Test 3 passed: Two tournaments and all championship counts");
+        check_results(32'd2, 1'b1);
+        $display("Test 3 passed: All 64 UART championship counts matched Python");
 
         set_count(32'd0);
         send_byte(8'h03);
@@ -189,7 +203,7 @@ module tb_top #(
         finish_reply();
         wait_for_batch();
         check_status(8'h06, 32'd0);
-        check_results(32'd0);
+        check_results(32'd0, 1'b0);
         $display("Test 4 passed: Zero-tournament batch clears results");
 
         $display("ALL TOP LEVEL TESTS PASSED");
